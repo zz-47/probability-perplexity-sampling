@@ -10,9 +10,9 @@ The full math of token probability, measured on real SLM logits — softmax and 
 |---|-------|-------------|--------|
 | 1 | Softmax, cross-entropy, the numerical floor | `p = softmax(z)`, `CE = logsumexp(z) − z_y` | ✅ Complete (5 experiments measured) |
 | 2 | Perplexity as an instrument | `PPL = exp(mean NLL)`, `BPB = (N/B)·log₂PPL` | ✅ Complete (5 experiments measured) |
-| 3 | Truncation under synthetic control | `D_KL(p′‖p) = −log(mass_kept)` | 🚧 Scaffolded — oracle sweeps pending |
-| 4 | Truncation operators on real logits | `KL(p′‖p)`, effective support, distinct-n | ⬜ Planned |
-| 5 | Scale-out: distribution shape 135M→1.7B | entropy / `top1` / `k90` vs model size | ⬜ Planned |
+| 3 | Truncation under synthetic control | `D_KL(p′‖p) = −log(mass_kept)` | ✅ Complete (5 experiments measured) |
+| 4 | Truncation operators on real logits | `KL(p′‖p)`, `n_kept` spread, `T`∘`Tr` ordering | ✅ Complete (4 experiments measured) |
+| 5 | Scale-out: distribution shape 135M→1.7B | entropy / `top1` / `k90` vs model size | 🚧 Scaffolded — 3 experiments pending |
 | 6 | Deployment decoding configs | operator ordering, determinism, ms/token | ⬜ Planned |
 
 ---
@@ -29,7 +29,7 @@ probability-perplexity-sampling/
 ├── 1_softmax_cross_entropy.ipynb      ← the logit→probability map, measured and stress-tested
 ├── 2_perplexity_instrument.ipynb      ← context length, stride, tokenizer: what moves the scalar
 ├── 3_truncation_controlled.ipynb      ← known-tail distributions, closed-form coverage vs measured cut
-├── 4_truncation_real_logits.ipynb     ← (planned) top-k / top-p / min-p on real next-token rows
+├── 4_truncation_real_logits.ipynb     ← same operators on real rows: does the ordering survive?
 ├── 5_scaleout_distribution_shape.ipynb← (planned) does distribution shape travel 135M→1.7B?
 └── 6_decoding_deployment.ipynb        ← (planned) ordering, seeds, latency per operator
 ```
@@ -103,21 +103,71 @@ Each notebook is **self-contained**, runs on CPU-only Windows, and follows the *
 
 ---
 
-## Study 3 — Truncation under synthetic control (scaffolded)
+## Study 3 — Truncation under synthetic control: what top-k, top-p and min-p actually remove (complete)
 
-**Question.** On real logits, nobody knows what a truncation operator removed: the true distribution is unavailable, so a cut can be described but never scored. Build the distribution first — with a designated signal head and a noise tail of exactly known mass — and the correct cut becomes a number.
+**Design.** Two-block Zipf distributions over a 49,152-symbol alphabet with a designated signal head and a noise tail of exactly known mass, symbol order permuted under a fixed seed so head membership is recoverable only from probability values. Three cases: **peaked** (`n_sig = 5`, `exp(H) = 5.7`), **typical** (`n_sig = 250`, `m_sig = 0.85`, `s_head = 1.4` — grid-searched to `exp(H) = 61.1`, `k90 = 240` against measured real-logit medians of 66.6 and 222), and **flat** (`n_sig = 5000`, `exp(H) = 4907`). The three operators are written from their definitions and scored on `mass_kept`, `n_kept`, `noise_removed`, `signal_lost`, `D_KL` and `exp(H′)`. Float64, no model loaded — the only model-free study in the repository, which is what makes its ground truth exact.
 
-**Design.** Zipf-shaped distributions over a 49,152-symbol alphabet, symbol order shuffled under a fixed seed so head membership is recoverable only from the probabilities. Three cases: **peaked** (`n_sig = 5`, `m_sig = 0.95`), **typical** (`n_sig = 250`, `m_sig = 0.85`, `s_head = 1.4` — grid-searched to land at `exp(H) ≈ 61`, `k90 ≈ 240` against the measured real-logit medians of 66.6 and 222), and **flat** (`n_sig = 5000`). Top-k, top-p, and min-p are implemented from their definitions and scored on `mass_kept`, `n_kept`, `noise_removed`, `signal_lost`, `D_KL`, and `exp(H′)`. Float64 throughout, no model loaded.
+**Measured findings (synthetic, ground truth known):**
 
-**The math the study rests on.** For any pure truncation with retained mass `M`, renormalization gives `p′_i = p_i/M` on the support, so
+| # | Claim | Predicted | Measured | Verdict |
+|---|---|---|---|---|
+| C1 | `D_KL(p′‖p) = −log(mass_kept)` | ≤ 1e-12 float64 | **3.33e-16** over 10 settings; float32 **1.54e-07** | ✅ Holds |
+| C2 | All three tunable to the oracle cut | `noise_rm > 0.95`, `sig_lost < 0.05` | best **0.7219 / 0.6902 / 0.6701**; best `sig_lost` **0.1779** | ❌ Reversed — all fail |
+| C3 | Fixed `k` fails under shape change | spread > 0.4 | **0.9608** (0.0392 → 1.0000) | ✅ Holds |
+| C4 | Top-p holds mass, not count | `n_kept` > 10×, mass < 0.01 | **355.3×** (10 → 3,553), mass range **0.0072** | ✅ Holds |
+| C5 | Min-p adapts best | smallest spread | **top-p 0.4941** < min-p 0.6079 < top-k 0.9608 | ❌ Reversed |
+| C6 | Top-p degenerates on flat | `n_kept` > 1,000 | **4,815** of 49,152 | ✅ Holds |
 
-`D_KL(p′‖p) = Σ_{i∈S} (p_i/M)·log((p_i/M)/p_i) = −log M`
+**Three conventional defaults, one distribution, a 48× spread.** On the typical case, `min_p = 0.1` keeps **5** candidates, `top_k = 50` keeps **50**, `top_p = 0.9` keeps **240**. Anyone switching a serving config between these moves the surviving candidate set by nearly two orders of magnitude without changing anything they would describe as a policy. `exp(H)` falls from 61.1 to 3.6 / 13.1 / 24.4 respectively — the mechanical reason sampled text changes character when these knobs move.
 
-The distortion depends on **nothing but the retained mass** — two operators keeping 90% are equally "distorted" even if one kept pure signal and the other pure noise. KL measures how much was cut, never whether the right thing was cut, which is precisely why oracle-based scores are carried alongside it. The reverse direction `D_KL(p‖p′)` is infinite for any truncation.
+**C2 reversed, and the failure is structural rather than a tuning problem.** No setting of any operator recovers the designed head: best scores 0.722, 0.690, 0.670 against a possible 1.0, with the best achievable signal loss at 0.1779 versus a 0.05 bar. The reason is that the head is itself Zipf-shaped, so its weakest members carry *less* probability than the tail's strongest members — the two sets **interleave in probability**. Every one of these operators is a single threshold (on rank, on cumulative mass, or on height relative to the peak), and no threshold separates interleaved sets. They are not failing to find a boundary that exists; there is no boundary to find in the only coordinate they can read. That is the strongest available argument for why decoding heuristics remain heuristics.
 
-**Pre-committed board:** the KL identity holds to 1e-12 in float64 (C1); all three operators can be tuned to the oracle cut on a fixed distribution (C2); a fixed `k` fails under a shape change with `noise_removed` spread > 0.4 (C3); top-p holds mass while its count swings > 10× (C4); min-p has the smallest spread (C5); top-p degenerates to `n_kept > 1000` on the flat case (C6).
+**C5 reversed — min-p's adaptivity points the wrong way.** Predicted most stable, measured **second worst**: `noise_removed` spreads of top-p 0.4941, min-p 0.6079, top-k 0.9608. Min-p thresholds at `α·max(p)`, so its cut tracks the peak; on a flat distribution the peak is small and the *relative* rule keeps only 46 symbols while discarding **53.6% of the head**. It becomes more aggressive exactly where the distribution is widest and the model least certain. Across the sweep its `n_kept` collapses 46 → 4 while `signal_lost` never falls below 0.17.
 
-**Status:** scaffold written with full pseudocode structure per experiment, code cells open, board pre-committed.
+**Top-p's real guarantee, found rather than predicted.** It records `signal_lost = 0.0000` on the three flattest cases. Being mass-based, it cannot cut into the head while the head is diffuse — the head's mass is exhausted before its symbols are. That structural property is why its noise-removal spread is smallest despite its count varying 355×. The price is C6: on the flattest case it keeps 4,815 symbols, so a nucleus is not a nucleus when entropy is high.
+
+**Reading the three as a design space.** Each pins one quantity and lets the others float — top-k pins count and loses control of mass *and* of noise removal; top-p pins mass and keeps the most control of noise; min-p pins relative height and controls neither. Of the three invariants, **mass is the one worth having**, not because it is intrinsically better but because on Zipf-like distributions it is the only one whose failure mode is bounded.
+
+**KL cannot arbitrate, and the identity proves it.** `D_KL(p′‖p) = −log M` holds to 3.33e-16, so KL is a monotone function of retained mass and nothing else. In the defaults table min-p has the **highest** KL (0.592) and the **best** noise removal (1.0000); top-p has the **lowest** KL (0.105) and the **worst** (0.586). Ranking operators by divergence ranks them by how much they cut — the parameter, not the outcome. The reverse direction is worse than uninformative: 48,912 of 49,152 coordinates have `p > 0` but `p′ = 0`, so `D_KL(p‖p′)` is undefined rather than merely large.
+
+**A precision result carried from the first study.** The KL identity holds to 3.33e-16 in float64 but only **1.54e-07** in float32 — nine orders of magnitude, just above eps, from summing 49,152 terms spanning many orders of magnitude. Same mechanism as the naive-softmax floor of 1.681e-05. Vocabulary size sets the precision floor, not the operator, and real decoding stacks run this arithmetic in float32 or bf16.
+
+**Verdict in one line.** No operator recovers the head at any setting because head and tail interleave in probability; among the three, the one marketed as adaptive is measurably the second least stable under a change of shape, and the mass-based rule is the only one with a bounded failure mode.
+
+---
+
+## Study 4 — Truncation on real logits: does the controlled ordering survive? (scaffolded)
+
+**Question.** The controlled study could score a cut because the head was designed. On real logits that is impossible. Rather than fall back on downstream text quality, this study keeps the measurement at the distribution level and replaces "was the cut correct" with "**how much does the cut vary across the positions the operator will actually meet**" — variance under a fixed setting, measurable without an oracle, and the property that matters in deployment.
+
+**Design.** Four experiments on the cached `Z ∈ R^{83×49152}` from study 1 — no model enters the kernel. The same operator implementations as study 3, verbatim, so the two are exactly comparable. Positions span `k90` from **1 to 12,097**, a wider range than anything the synthetic sweep constructed.
+
+**Pre-committed board:** a fixed `k = 50` spans > 0.5 in `mass_kept` across positions (C1); top-p's count varies more than the synthetic 355× (C2); the controlled stability ordering transfers, top-p < min-p < top-k (C3); min-p's `n_kept` correlates *negatively* with position width (C4); operator ordering matters less than operator choice (C5); all three keep < 25% of `V` at the widest position (C6).
+
+**The composition result the study turns on.** Temperature and truncation do not commute. For top-k the supports coincide — temperature is rank-preserving, so `log(p_i/p_j)` scales by `1/T` but never changes sign — yet the surviving *probabilities* differ, because one order renormalizes before rescaling and the other after. For top-p and min-p even the support changes, since flattening the curve forces a mass threshold further down the ranking. The size of that effect is measured against the size of the operator-choice effect.
+
+**What it deliberately does not do.** Nothing here evaluates text. A distribution-level measurement can show a cut varying by two orders of magnitude across positions; it cannot show the resulting samples are better or worse. The two levels answer different questions, and the distribution level's advantage is that it does not depend on a rater.
+
+**Measured findings (real SmolLM2-135M logits, not assumed):**
+
+| # | Claim | Predicted | Measured | Verdict |
+|---|---|---|---|---|
+| C1 | Fixed `k = 50` varies across positions | `mass_kept` spans > 0.5 | **0.8244** (0.174 → 0.999) | ✅ Holds |
+| C2 | Top-p's count varies more than synthetic | `n_kept` spread > 355× | **12,097×** (1 → 12,097) | ✅ Holds |
+| C3 | Controlled ordering transfers | top-p < min-p < top-k | top-p 0.095 < **top-k 0.824** < min-p 0.863 | ❌ Reversed |
+| C4 | Min-p most aggressive at high entropy | negative correlation | Spearman **+0.457** | ❌ Reversed |
+| C5 | Ordering matters less than operator choice | ordering TVD < between-op TVD | ordering 0.416 > min between-op 0.170 | ❌ Reversed |
+| C6 | All keep < 25% of V at widest position | each keeps < 25% | top-k 0.10%, top-p 24.6%, min-p 0.05% | ✅ Holds |
+
+**Top-p is the winner on stability and it's not close.** Mass spread **0.095** vs top-k 0.824 / min-p 0.863 — roughly 9× tighter. **C1 ✅** (top-k mass spread 0.824). **C2 ✅** (top-p `n_kept` swings 12,097× vs synthetic 355×). **C6 ✅** (all under 25% at the widest position).
+
+**C3/C4/C5 all reverse, two of them sharply.** The controlled study's ordering (top-p < min-p < top-k) does *not* transfer: top-k (0.824) beats min-p (0.863), so the measured ordering is top-p < top-k < min-p. Min-p's negative correlation was specific to synthetic flat distributions; on real data it is **+0.457** (weakly adaptive, not inverted). And operator ordering matters *more* than operator choice at high temperature: at T=1.5 the temperature-then-cut vs cut-then-temperature supports differ at all 83 positions (mean TVD 0.416), exceeding the smallest between-operator distance (0.170).
+
+**Top-p's real guarantee, and its real cost.** Spearman(k90, n_kept) = **+1.000** — it widens exactly where the distribution widens, the only operator whose count actually tracks what each position needs. But that adaptivity is the 12,097× swing: at the widest position top-p hands the sampler **12,097 candidates (24.6% of the vocabulary)**. A nucleus is not a nucleus when entropy is high.
+
+**Top-k's rank invariance, confirmed.** Temperature is rank-preserving, so top-k picks the same 50 tokens whether you apply T before or after the cut — **0/83** supports differ at any T. The probabilities differ (renormalization order), but the support doesn't. That is a structural guarantee the other two operators do not have.
+
+**Verdict in one line.** On real logits the mass-based rule is still the most stable across positions, but three of six predictions reverse — most sharply the claim that operator ordering matters less than operator choice.
 
 ---
 
