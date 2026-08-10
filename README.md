@@ -9,8 +9,8 @@ The full math of token probability, measured on real SLM logits — softmax and 
 | # | Topic | Core formula | Status |
 |---|-------|-------------|--------|
 | 1 | Softmax, cross-entropy, the numerical floor | `p = softmax(z)`, `CE = logsumexp(z) − z_y` | ✅ Complete (5 experiments measured) |
-| 2 | Perplexity as an instrument | `PPL = exp(mean NLL)`, `BPB = Λ/bytes` | 🚧 Scaffolded — protocol sweeps pending |
-| 3 | Truncation under synthetic control | closed-form coverage vs measured cut | ⬜ Planned |
+| 2 | Perplexity as an instrument | `PPL = exp(mean NLL)`, `BPB = (N/B)·log₂PPL` | ✅ Complete (5 experiments measured) |
+| 3 | Truncation under synthetic control | `D_KL(p′‖p) = −log(mass_kept)` | 🚧 Scaffolded — oracle sweeps pending |
 | 4 | Truncation operators on real logits | `KL(p′‖p)`, effective support, distinct-n | ⬜ Planned |
 | 5 | Scale-out: distribution shape 135M→1.7B | entropy / `top1` / `k90` vs model size | ⬜ Planned |
 | 6 | Deployment decoding configs | operator ordering, determinism, ms/token | ⬜ Planned |
@@ -22,18 +22,21 @@ The full math of token probability, measured on real SLM logits — softmax and 
 ```
 probability-perplexity-sampling/
 ├── README.md                          ← this file
+├── NOTATION.md                        ← every symbol, metric, and named operation, defined once
 ├── requirements.txt                   ← pinned env (torch 2.13.0+cpu, transformers 5.14.1)
 ├── .venv/                             ← local environment (hidden, gitignored)
 ├── pps_cache/                         ← cached logit tensors, models never re-enter the kernel
 ├── 1_softmax_cross_entropy.ipynb      ← the logit→probability map, measured and stress-tested
 ├── 2_perplexity_instrument.ipynb      ← context length, stride, tokenizer: what moves the scalar
-├── 3_truncation_controlled.ipynb      ← (planned) known-tail distributions, closed-form coverage
+├── 3_truncation_controlled.ipynb      ← known-tail distributions, closed-form coverage vs measured cut
 ├── 4_truncation_real_logits.ipynb     ← (planned) top-k / top-p / min-p on real next-token rows
 ├── 5_scaleout_distribution_shape.ipynb← (planned) does distribution shape travel 135M→1.7B?
 └── 6_decoding_deployment.ipynb        ← (planned) ordering, seeds, latency per operator
 ```
 
 Each notebook is **self-contained**, runs on CPU-only Windows, and follows the *hypothesis → measurement → verdict* narrative. Model weights are never copied into the repository: `HF_HUB_OFFLINE=1` resolves every load against the shared local hub cache.
+
+**Claim labels are `C1 … C6`**, not `H1 … H6`, so that `H` unambiguously means Shannon entropy — which appears as a measured quantity in several studies. Full symbol table in `NOTATION.md`.
 
 ---
 
@@ -45,11 +48,11 @@ Each notebook is **self-contained**, runs on CPU-only Windows, and follows the *
 
 | # | Claim | Predicted | Measured | Verdict |
 |---|---|---|---|---|
-| H1 | shift invariance holds to float noise | ≤ 1e-7 | **1.192e-07** = float32 eps, worst case over `c ∈ [−100, 100]` | ✅ Holds |
-| H2 | naive softmax overflows, stable form does not | `nan` past shifted max 88.72 | `nan` at `c = 60` → shifted max **89.13**; analytic crossing 59.585 | ✅ Holds |
-| H3 | three routes to cross-entropy agree | ≤ 1e-6 | gather ≡ `F.cross_entropy` at **0.0**; closed form off **2.97e-05** | ⚠️ Partial |
-| H4 | entropy strictly increasing in `T`, ceiling `log V` | monotone, within 0.05 | monotone **True**, gap **0.0005**, `dH/dT = Var/T³` verified to 1e-3 | ✅ Holds |
-| H5 | real distributions are far from uniform | median `k90` < 50, `exp(H)` < 200 | `exp(H)` **66.6** ✓, `k90` **222** ✗ | ⚠️ Partial |
+| C1 | shift invariance holds to float noise | ≤ 1e-7 | **1.192e-07** = float32 eps, worst case over `c ∈ [−100, 100]` | ✅ Holds |
+| C2 | naive softmax overflows, stable form does not | `nan` past shifted max 88.72 | `nan` at `c = 60` → shifted max **89.13**; analytic crossing 59.585 | ✅ Holds |
+| C3 | three routes to cross-entropy agree | ≤ 1e-6 | gather ≡ `F.cross_entropy` at **0.0**; closed form off **2.97e-05** | ⚠️ Partial |
+| C4 | entropy strictly increasing in `T`, ceiling `log V` | monotone, within 0.05 | monotone **True**, gap **0.0005**, `dH/dT = Var/T³` verified to 1e-3 | ✅ Holds |
+| C5 | real distributions are far from uniform | median `k90` < 50, `exp(H)` < 200 | `exp(H)` **66.6** ✓, `k90` **222** ✗ | ⚠️ Partial |
 
 **The tail sets the width, not the head.** Median `top1` is 0.259 and median `exp(H)` is 66.6 — from which `k90 < 50` looked safe. Measured `k90 = 222`, a **3.3× gap** between the mass-weighted width and the token count. `exp(H)` is dominated by the head; `k90` must walk the tail. Any operator sized from head statistics will mis-cut.
 
@@ -67,26 +70,62 @@ Each notebook is **self-contained**, runs on CPU-only Windows, and follows the *
 
 ---
 
-## Study 2 — Perplexity as an instrument: what the number depends on besides the model (scaffolded)
+## Study 2 — Perplexity as an instrument: what the number depends on besides the model (complete)
 
-**Question.** Perplexity is reported as a property of a model. It is a property of a model *and* a tokenizer *and* a context length *and* a stride *and* a corpus. Hold the model fixed — literally the same cached weights — move everything else, and measure how far the reported scalar travels.
+**Design.** The model is frozen — literally the same cached weights — and only the instrument moves. A `score(ids, L, S)` rig walks the sequence in end-anchored windows of `L` at stride `S`, scoring each token **exactly once** and asserting `n_scored == N − 1` and `maxwin ≤ L` on every call. Four experiments follow: a context-length sweep at stride 1, a stride sweep at `L = 128`, a cross-tokenizer comparison against DistilGPT2 on the identical raw string, and a calibration test of perplexity against the model's own `exp(mean H)`. Passage: 486 SmolLM2 tokens / 2,628 bytes.
 
-**Design.** Four experiments on one scorer. A `score(ids, L, S)` rig walks the sequence in windows of `L` at stride `S`, scoring each token **exactly once** (overlapping context, never overlapping scored positions — the double-counting bug is asserted against in the rig itself). Then: a context-length sweep at stride 1, a stride sweep at fixed window, a cross-tokenizer comparison against DistilGPT2 (50,257-way GPT-2 BPE) on the identical raw string, and a calibration test of perplexity against the model's own `exp(mean H)`.
+**Measured findings (SmolLM2-135M, not assumed):**
 
-**Pre-committed hypothesis board:** PPL falls monotonically with context (H1) and saturates before the full window (H2); disjoint chunking overstates PPL by ≥ 1.3× against stride-1 (H3); per-token PPL differs across tokenizers by ≥ 20% (H4) and bits-per-byte closes most of that gap (H5); the model is over-confident on this text, `PPL > exp(mean H)` (H6).
+| # | Claim | Predicted | Measured | Verdict |
+|---|---|---|---|---|
+| C1 | PPL falls monotonically with context length | monotone decreasing | strictly monotone `L = 8 → 256`; **−0.3% at full context** | ⚠️ Partial |
+| C2 | The curve saturates before the full window | most gain by `L ≈ 64` | still improving **9% per doubling at `L = 256`** | ❌ Reversed |
+| C3 | Disjoint chunking overstates PPL | ≥ 1.3× stride-1 | **1.214×** (38.096 vs 31.377) | ⚠️ Partial |
+| C4 | Per-token PPL is not cross-tokenizer comparable | ≥ 20% apart | **2.562×** apart | ✅ Holds (wrong mechanism) |
+| C5 | BPB closes the cross-tokenizer gap | BPB nearer 1 than PPL | **1.301× vs 2.562×** | ✅ Holds (wrong mechanism) |
+| C6 | The model is over-confident on this text | `PPL > exp(mean H)` | **28.871 vs 28.116**, +0.0265 nats | ✅ Holds, marginally |
 
-**The math the study rests on.** `PPL = exp(−(1/N)Σ log q(x_t|x_{<t}))` is the geometric mean of `1/q(x_t)`, so it is dominated by the worst positions rather than the typical one. Conditioning on less cannot help on average (`E[−log q(x_t|x_{t−L+1:t−1})] ≥ E[−log q(x_t|x_{<t})]`), which forces H1's direction but says nothing about the saturation point. With window `L` and stride `S`, scored tokens average `L − (S+1)/2` tokens of context at a cost of `N/S` forward passes — the entire stride trade in one line. And since the token count `N` is a tokenizer's choice, only `BPB = Λ/bytes = (N/B)·log₂(PPL)` is comparable across segmentations.
+**Protocol moves the number more than the model does.** Total swing from `L = 8` to full context is **3.53×** — larger than the **2.562×** gap this same study measures between SmolLM2-135M and DistilGPT2, two entirely different models. A perplexity quoted without its context length, stride, and tokenizer is not a measurement of a model.
 
-**Stated confound.** DistilGPT2 differs in weights and training data as well as tokenizer, so the residual BPB gap is not attributable to segmentation. The narrower claim under test — that the **PPL gap overstates the BPB gap** — is valid despite the confound, and is the reason BPB is the quantity being defended.
+**There is no saturation (C2 reversed).** NLL drops 0.609, 0.298, 0.162, 0.109, 0.087 per doubling of `L`: **each doubling buys ~60% of what the previous doubling bought**, a smooth geometric decay still running 9% per doubling at `L = 256`. The prediction that context stops helping by `L ≈ 64` was wrong by a wide margin — `L = 64` sits 21% above the best measured value, and the doublings past it still buy 11.5% then 9%. The model draws usable signal from tokens 64 to 256 positions back; it is not a 64-gram. Because the gains shrink at a constant *rate* rather than hitting a floor, there is no principled place to stop — only a cost curve. Long-range mutual information in ordinary prose is small but never zero.
 
-**Status:** scaffold written, code cells open, hypothesis board pre-committed.
+**The stride knee is sharp, and stride-1 is not the gold standard.** Disjoint chunking costs 1.214×, but the gap closes almost immediately: `S = 16` recovers **93.1% at 6.4% of stride-1's compute**, `S = 8` reaches 99.1% at 12.6%, `S = 4` recovers 100% at 25%. Stride-1 itself lands at **98.1%** — worse than `S = 4` and `S = 8` while costing four to eight times as much.
+
+**Two independent inversions.** `L = 256` beats full context by 0.3%, and `S = 4` beats `S = 1` by 0.4%. The first is explained: the full-context row averages over a 1-to-485 context ramp while the strided rows sit nearly flat at 255, so they are different protocols and the conditioning inequality does not apply between them. The second has no such explanation and stands as measured. One passage cannot separate genuine long-range interference from position-specific noise, so it is reported rather than resolved.
+
+**Bits-per-byte corrected almost nothing here, and that is the finding.** Two independently trained BPE vocabularies produced nearly identical segmentations — 486 tokens against 494, **fertility ratio 1.016×**, differing in one boundary out of the first fourteen (`ĠT`/`rained` vs `ĠTr`/`ained`). Convergence is the expected outcome: BPE is a greedy frequency-merge procedure, so two runs over comparable English corpora discover nearly the same merges in nearly the same order. So the 2.562× PPL gap was never a tokenizer artifact; it was model quality all along. The BPB ratio of 1.301× decomposes as `log₂(73.965)/log₂(28.871) = 1.280` times fertility `1.016` — **the logarithm supplies 98% of the apparent correction**. BPB remains the right unit (a character-level tokenizer would show fertility 4–5× and the correction would be real), but on this pair, saying BPB "removed the tokenizer effect" would be reporting a change of units.
+
+**Calibration is set by the tail, not the centre.** In aggregate the model is over-confident by **+0.0265 nats** (2.7%). At the median position it is *under*-confident by more than a nat — median NLL **2.433** against median H **3.509** — and only **37.3%** of positions are over-confident at all. Both quantities are averages in log space, so a small minority of catastrophic positions erases the accumulated slack of hundreds of well-hedged ones. A model tuned to improve mean calibration would be tuning against a few dozen positions out of five hundred. Plainly: the model knows what it does not know most of the time, and is spectacularly wrong a few times — and averaging in log space lets those few decide the headline.
+
+**A rig correction worth recording.** The scaffold predicted mean context `L − (S+1)/2` = 127 at `L = 128, S = 1`; measured **110.5**. The formula is steady-state only — the first 127 targets sit in a window pinned at `begin = 0` and receive 1, 2, … 127 tokens rather than 127 each. Exact accounting `(127·128/2 + 127·358)/485 = 110.5` reproduces it. Separately, the rig's index algebra was verified by exhaustive simulation over the full `(L, S)` grid before use, which is how the constraint `S ≤ L − 1` surfaced: a window of `L` tokens has no predictor for its own first token, so **disjoint chunking is `S = L − 1`**, not `S = L`.
+
+**Verdict in one line.** Holding the model perfectly fixed, protocol alone moves the reported perplexity by 3.53× — more than the gap between two different models — and the stride cost curve says `S ≈ L/8` buys 93% of the sliding-window benefit for 6.4% of the compute.
+
+---
+
+## Study 3 — Truncation under synthetic control (scaffolded)
+
+**Question.** On real logits, nobody knows what a truncation operator removed: the true distribution is unavailable, so a cut can be described but never scored. Build the distribution first — with a designated signal head and a noise tail of exactly known mass — and the correct cut becomes a number.
+
+**Design.** Zipf-shaped distributions over a 49,152-symbol alphabet, symbol order shuffled under a fixed seed so head membership is recoverable only from the probabilities. Three cases: **peaked** (`n_sig = 5`, `m_sig = 0.95`), **typical** (`n_sig = 250`, `m_sig = 0.85`, `s_head = 1.4` — grid-searched to land at `exp(H) ≈ 61`, `k90 ≈ 240` against the measured real-logit medians of 66.6 and 222), and **flat** (`n_sig = 5000`). Top-k, top-p, and min-p are implemented from their definitions and scored on `mass_kept`, `n_kept`, `noise_removed`, `signal_lost`, `D_KL`, and `exp(H′)`. Float64 throughout, no model loaded.
+
+**The math the study rests on.** For any pure truncation with retained mass `M`, renormalization gives `p′_i = p_i/M` on the support, so
+
+`D_KL(p′‖p) = Σ_{i∈S} (p_i/M)·log((p_i/M)/p_i) = −log M`
+
+The distortion depends on **nothing but the retained mass** — two operators keeping 90% are equally "distorted" even if one kept pure signal and the other pure noise. KL measures how much was cut, never whether the right thing was cut, which is precisely why oracle-based scores are carried alongside it. The reverse direction `D_KL(p‖p′)` is infinite for any truncation.
+
+**Pre-committed board:** the KL identity holds to 1e-12 in float64 (C1); all three operators can be tuned to the oracle cut on a fixed distribution (C2); a fixed `k` fails under a shape change with `noise_removed` spread > 0.4 (C3); top-p holds mass while its count swings > 10× (C4); min-p has the smallest spread (C5); top-p degenerates to `n_kept > 1000` on the flat case (C6).
+
+**Status:** scaffold written with full pseudocode structure per experiment, code cells open, board pre-committed.
 
 ---
 
 ## Caveats carried across the repository
 
-- **One passage, one primary model.** Absolute numbers (`k90`, `exp(H)`, perplexity) describe this text under SmolLM2-135M. Ratios and identities are the transferable content.
+- **One passage per study, one primary model.** Absolute numbers (`k90`, `exp(H)`, perplexity, BPB) describe the specific text under SmolLM2-135M. Ratios and identities are the transferable content.
 - **Positions are not i.i.d.** They come from a single document, so medians are descriptive, not corpus statistics.
-- **float32 throughout.** Deliberate: several claims are about float32 boundaries. bf16 inference would move the numerical findings and not the structural ones.
+- **float32 throughout studies 1–2, float64 in study 3.** Deliberate: several claims are about float32 boundaries, while study 3's exactness claim would be untestable at float32.
 - **Final-layer logits only.** No intermediate-layer probing; the object under study is the head's output.
+- **Cross-model comparisons confound weights with tokenizer.** DistilGPT2 differs from SmolLM2 in training data and parameters as well as segmentation; only the narrow claims are drawn.
 - **Model weights live in the shared HF hub cache.** Nothing is copied into the repository; `HF_HUB_OFFLINE=1` guarantees no network access at run time.
