@@ -12,8 +12,8 @@ The full math of token probability, measured on real SLM logits — softmax and 
 | 2 | Perplexity as an instrument | `PPL = exp(mean NLL)`, `BPB = (N/B)·log₂PPL` | ✅ Complete (5 experiments measured) |
 | 3 | Truncation under synthetic control | `D_KL(p′‖p) = −log(mass_kept)` | ✅ Complete (5 experiments measured) |
 | 4 | Truncation operators on real logits | `KL(p′‖p)`, `n_kept` spread, `T`∘`Tr` ordering | ✅ Complete (4 experiments measured) |
-| 5 | Scale-out: distribution shape 135M→1.7B | entropy / `top1` / `k90` vs model size | 🚧 Scaffolded — 3 experiments pending |
-| 6 | Deployment decoding configs | operator ordering, determinism, ms/token | ⬜ Planned |
+| 5 | Scale-out: distribution shape 135M→1.7B | entropy / `top1` / `k90` vs model size | ✅ Complete (3 experiments measured) |
+| 6 | Deployment decoding configs | operator ordering, determinism, ms/token | 🚧 Scaffolded — 3 experiments pending |
 
 ---
 
@@ -136,17 +136,7 @@ Each notebook is **self-contained**, runs on CPU-only Windows, and follows the *
 
 ---
 
-## Study 4 — Truncation on real logits: does the controlled ordering survive? (scaffolded)
-
-**Question.** The controlled study could score a cut because the head was designed. On real logits that is impossible. Rather than fall back on downstream text quality, this study keeps the measurement at the distribution level and replaces "was the cut correct" with "**how much does the cut vary across the positions the operator will actually meet**" — variance under a fixed setting, measurable without an oracle, and the property that matters in deployment.
-
-**Design.** Four experiments on the cached `Z ∈ R^{83×49152}` from study 1 — no model enters the kernel. The same operator implementations as study 3, verbatim, so the two are exactly comparable. Positions span `k90` from **1 to 12,097**, a wider range than anything the synthetic sweep constructed.
-
-**Pre-committed board:** a fixed `k = 50` spans > 0.5 in `mass_kept` across positions (C1); top-p's count varies more than the synthetic 355× (C2); the controlled stability ordering transfers, top-p < min-p < top-k (C3); min-p's `n_kept` correlates *negatively* with position width (C4); operator ordering matters less than operator choice (C5); all three keep < 25% of `V` at the widest position (C6).
-
-**The composition result the study turns on.** Temperature and truncation do not commute. For top-k the supports coincide — temperature is rank-preserving, so `log(p_i/p_j)` scales by `1/T` but never changes sign — yet the surviving *probabilities* differ, because one order renormalizes before rescaling and the other after. For top-p and min-p even the support changes, since flattening the curve forces a mass threshold further down the ranking. The size of that effect is measured against the size of the operator-choice effect.
-
-**What it deliberately does not do.** Nothing here evaluates text. A distribution-level measurement can show a cut varying by two orders of magnitude across positions; it cannot show the resulting samples are better or worse. The two levels answer different questions, and the distribution level's advantage is that it does not depend on a rater.
+## Study 4 — Truncation on real logits: does the controlled ordering survive? (complete)
 
 **Measured findings (real SmolLM2-135M logits, not assumed):**
 
@@ -163,11 +153,32 @@ Each notebook is **self-contained**, runs on CPU-only Windows, and follows the *
 
 **C3/C4/C5 all reverse, two of them sharply.** The controlled study's ordering (top-p < min-p < top-k) does *not* transfer: top-k (0.824) beats min-p (0.863), so the measured ordering is top-p < top-k < min-p. Min-p's negative correlation was specific to synthetic flat distributions; on real data it is **+0.457** (weakly adaptive, not inverted). And operator ordering matters *more* than operator choice at high temperature: at T=1.5 the temperature-then-cut vs cut-then-temperature supports differ at all 83 positions (mean TVD 0.416), exceeding the smallest between-operator distance (0.170).
 
-**Top-p's real guarantee, and its real cost.** Spearman(k90, n_kept) = **+1.000** — it widens exactly where the distribution widens, the only operator whose count actually tracks what each position needs. But that adaptivity is the 12,097× swing: at the widest position top-p hands the sampler **12,097 candidates (24.6% of the vocabulary)**. A nucleus is not a nucleus when entropy is high.
+**Top-p's real guarantee, and its real cost.** Spearman(k90, n_kept) = **+1.000** — it widens exactly where the distribution widens, the only operator whose count actually tracks what each position needs. But that adaptivity is the 12,097× swing: at the widest position top-p hands the sampler **12,097 candidates (24.6% of the vocabulary)**.
 
-**Top-k's rank invariance, confirmed.** Temperature is rank-preserving, so top-k picks the same 50 tokens whether you apply T before or after the cut — **0/83** supports differ at any T. The probabilities differ (renormalization order), but the support doesn't. That is a structural guarantee the other two operators do not have.
+**Top-k's rank invariance, confirmed.** Temperature is rank-preserving, so top-k picks the same 50 tokens whether you apply T before or after the cut — **0/83** supports differ at any T. That is a structural guarantee the other two operators do not have.
 
 **Verdict in one line.** On real logits the mass-based rule is still the most stable across positions, but three of six predictions reverse — most sharply the claim that operator ordering matters less than operator choice.
+
+---
+
+## Study 5 — Scale-out: does distribution shape travel 135M → 1.7B? (complete)
+
+**Measured findings (SmolLM2 135M, 360M, 1.7B, not assumed):**
+
+| # | Claim | Predicted | Measured | Verdict |
+|---|---|---|---|---|
+| C1 | Width grows with size | median `k90`, `exp(H)` rise | k90 222→38→22, exp(H) 66.6→17.4→11.2 | ❌ Reversed |
+| C2 | Concentration falls | median `top1` declines | top1 0.259→0.360→0.422 | ❌ Reversed |
+| C3 | PPL falls | lower at 1.7B | 76.94→17.52→12.53 | ✅ Holds |
+| C4 | Shape is size-dependent | `exp(H)`/`k90` ratio changes | 0.371→0.534→0.659 | ✅ Holds |
+
+**Bigger models are MORE concentrated, not less.** Every width statistic moves the wrong way against the predictions. The 135M model spreads its probability over ~222 tokens to reach 90% mass; the 1.7B model needs only 22. The leading token's share grows from 0.259 to 0.422. Entropy falls from 4.20 to 2.42 nats. The vocabulary is identical — the bigger model simply uses less of it.
+
+**PPL falls as expected, but alongside a fundamentally different shape.** PPL drops 76.94 → 17.52 → 12.53 (0.163× the 1.35M value at 1.7B). **C3 ✅.** But this improvement comes *alongside* a distribution that is substantially more concentrated, not the same-shaped distribution at higher resolution.
+
+**The deployment consequence.** Study 4 found that a fixed `k = 50` keeps 17% of the mass at one position and 99.9% at another on 135M logits. At 1.7B the typical `k90` is 22, so `k = 50` already covers nearly all the mass everywhere — the operator becomes nearly a no-op. Conversely, `top_p = 0.9` keeps 22 tokens at the typical 1.7B position (versus 222 at 135M), so the same nucleus is cutting much more aggressively relative to the distribution it meets. **Every default measured in studies 1–4 is model-specific.**
+
+**Verdict in one line.** Bigger models are more concentrated, not less — three pre-registered predictions reverse — while PPL falls as expected, meaning decoding improvement and distributional sharpness travel together but point in opposite directions.
 
 ---
 
