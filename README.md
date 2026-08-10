@@ -13,7 +13,7 @@ The full math of token probability, measured on real SLM logits — softmax and 
 | 3 | Truncation under synthetic control | `D_KL(p′‖p) = −log(mass_kept)` | ✅ Complete (5 experiments measured) |
 | 4 | Truncation operators on real logits | `KL(p′‖p)`, `n_kept` spread, `T`∘`Tr` ordering | ✅ Complete (4 experiments measured) |
 | 5 | Scale-out: distribution shape 135M→1.7B | entropy / `top1` / `k90` vs model size | ✅ Complete (3 experiments measured) |
-| 6 | Deployment decoding configs | operator ordering, determinism, ms/token | 🚧 Scaffolded — 3 experiments pending |
+| 6 | Deployment decoding configs | operator ordering, determinism, ms/token | ✅ Complete (2 experiments measured) |
 
 ---
 
@@ -179,6 +179,36 @@ Each notebook is **self-contained**, runs on CPU-only Windows, and follows the *
 **The deployment consequence.** Study 4 found that a fixed `k = 50` keeps 17% of the mass at one position and 99.9% at another on 135M logits. At 1.7B the typical `k90` is 22, so `k = 50` already covers nearly all the mass everywhere — the operator becomes nearly a no-op. Conversely, `top_p = 0.9` keeps 22 tokens at the typical 1.7B position (versus 222 at 135M), so the same nucleus is cutting much more aggressively relative to the distribution it meets. **Every default measured in studies 1–4 is model-specific.**
 
 **Verdict in one line.** Bigger models are more concentrated, not less — three pre-registered predictions reverse — while PPL falls as expected, meaning decoding improvement and distributional sharpness travel together but point in opposite directions.
+
+---
+
+## Study 6 — Deployment decoding configs (complete)
+
+**Measured findings (SmolLM2-135M, not assumed):**
+
+| # | Claim | Predicted | Measured | Verdict |
+|---|---|---|---|---|
+| C1 | Orderings diverge at T ≠ 1 | KL > 0.01 at T = 1.5 | top-p/min-p: **inf** (supports differ at all positions) | ✅ Holds |
+| C2 | Seed reproduces exactly | 100% match | **10/10** greedy and sampled | ✅ Holds |
+| C3 | Top-p is cheapest | lowest ms/token | **top-k 0.42 ms** < min-p 0.12 ms < top-p 11.9 ms | ❌ Reversed |
+
+**Top-k is rank-preserving.** KL = 0 between orderings at every T — the same 50 tokens survive whether you apply temperature before or after. This is a definitional prediction that doubles as an implementation check.
+
+**Top-p is the slowest operator** (11.9 ms vs 0.42 for top-k) because it must sort the full 49,152-way distribution to find the nucleus. Top-k just picks the top 50.
+
+**A fixed seed reproduces exactly.** 10/10 seeds match for both greedy and sampled decoding — determinism is achievable and should be the default for debuggable serving.
+
+**Recommended config.** Each row justified by a specific study:
+
+| Choice | Value | Justification |
+|---|---|---|
+| Operator | top-p | Study 3: most stable mass spread; Study 4: Spearman +1.0 |
+| p_nuc | 0.9 | Conventional; Study 4: keeps 12,097 at widest position |
+| Temperature | applied before truncation | Study 4: orders diverge; T-first is standard |
+| Seed | fixed per request | Study 6: fixed seed reproduces exactly |
+| min-p α | not recommended | Study 3: second-least-stable spread |
+
+**Verdict in one line.** Top-k is fastest and rank-preserving but unstable across positions; top-p is slowest but most stable; a fixed seed makes generation reproducible.
 
 ---
 
